@@ -1,0 +1,323 @@
+import math
+from dataclasses import dataclass, field
+
+import numpy as np
+
+import limits
+from identify import OUTPUTS, FOPDTModel, SaturatingModel
+
+PRESSURES = limits.PRESSURE_ORDER
+
+IDENTIFIED_SATURATING = {
+    "Q": (23.6103, 182.9253, 4.5596, 140.0),
+    "WHP": (333.8066, -161.2052, 8.0859, 140.0),
+    "FLP": (227.2177, -98.0204, 5.7953, 140.0),
+    "BHP": (3487.7920, -836.7140, 12.3422, 140.0),
+}
+
+IDENTIFIED_FOPDT = {
+    "Q": (1.8289, 4.6315, 37.3304, 0),
+    "WHP": (-1.6097, 8.2671, 321.5981, 0),
+    "FLP": (-0.9799, 5.8968, 219.8549, 0),
+    "BHP": (-8.3501, 12.5538, 3424.0771, 0),
+}
+
+DEFAULT_BACKOFF = {"WHP": 5.0, "FLP": 5.0, "BHP": 15.0}
+DEFAULT_SOFT_WEIGHT = {"WHP": 1.0, "FLP": 1.0, "BHP": 1.0}
+
+
+def build_models(structure="saturating", ts=limits.TS_HOURS):
+    if structure == "saturating":
+        return {
+            k: SaturatingModel(base=b, span=s, tau=t, scale=c, ts=ts)
+            for k, (b, s, t, c) in IDENTIFIED_SATURATING.items()
+        }
+    if structure == "fopdt":
+        return {
+            k: FOPDTModel(gain=g, tau=t, bias=b, delay=d, ts=ts)
+            for k, (g, t, b, d) in IDENTIFIED_FOPDT.items()
+        }
+    raise ValueError(f"unknown model structure: {structure!r}")
+
+
+def steady_choke_for_rate(models, target, lo=0.0, hi=100.0, tol=1e-4):
+    q = models["Q"]
+    if float(q.steady(hi)) <= target:
+        return hi
+    if float(q.steady(lo)) >= target:
+        return lo
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if float(q.steady(mid)) < target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def max_feasible_choke(models, backoff=None, lo=0.0, hi=100.0, tol=1e-4):
+    backoff = backoff or {}
+    def ok(u):
+        for k in PRESSURES:
+            if float(models[k].steady(u)) < limits.PRESSURE_LIMITS[k] + backoff.get(k, 0.0):
+                return False
+        return True
+
+    if ok(hi):
+        return hi
+    if not ok(lo):
+        return lo
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if ok(mid):
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return lo
+
+
+def backoff_production_cost(models=None, backoff=None):
+    models = models or build_models("saturating")
+    backoff = DEFAULT_BACKOFF if backoff is None else backoff
+    u_hard = max_feasible_choke(models, None)
+    u_soft = max_feasible_choke(models, backoff)
+    q_hard = float(models["Q"].steady(u_hard))
+    q_soft = float(models["Q"].steady(u_soft))
+    return {
+        "choke_hard": u_hard,
+        "choke_backoff": u_soft,
+        "choke_giveaway": u_hard - u_soft,
+        "rate_hard": q_hard,
+        "rate_backoff": q_soft,
+        "rate_giveaway": q_hard - q_soft,
+        "rate_giveaway_pct": 100.0 * (q_hard - q_soft) / q_hard if q_hard else 0.0,
+        "bbl_per_day": 24.0 * (q_hard - q_soft),
+    }
+
+
+@dataclass
+class MPCConfig:
+    horizon: int = 12
+    control_horizon: int = 3
+    move_weight: float = 2.0
+    structure: str = "saturating"
+    grid_points: int = 11
+    backoff: dict = field(default_factory=lambda: dict(DEFAULT_BACKOFF))
+    backoff_start: int = None
+    soft_weight: dict = field(default_factory=lambda: dict(DEFAULT_SOFT_WEIGHT))
+    soft_move_weight: float = 0.01
+    ts: float = limits.TS_HOURS
+    name: str = "mpc"
+
+    def __post_init__(self):
+        self.control_horizon = max(1, min(self.control_horizon, self.horizon))
+        if self.backoff_start is None:
+            self.backoff_start = min(self.horizon - 1, max(0, self.horizon // 2))
+        self.backoff_start = min(max(0, self.backoff_start), self.horizon - 1)
+
+
+ABLATIONS = {
+    "mpc_h12_sat": MPCConfig(horizon=12, control_horizon=3, structure="saturating",
+                             name="MPC h=12, saturating"),
+    "mpc_h1_sat": MPCConfig(horizon=1, control_horizon=1, structure="saturating",
+                            name="one-step h=1, saturating"),
+    "mpc_h12_lin": MPCConfig(horizon=12, control_horizon=3, structure="fopdt",
+                             name="MPC h=12, linear FOPDT"),
+    "mpc_h1_lin": MPCConfig(horizon=1, control_horizon=1, structure="fopdt",
+                            name="naive h=1, linear FOPDT"),
+}
+
+
+class ChokeMPC:
+    """Receding-horizon choke controller.
+
+    Sees the plant only through the measurement tuple handed to compute();
+    it never imports or inspects the simulator. Prediction uses the models
+    identified in identify.py.
+
+    The one-step baseline is this same class with horizon=1 and
+    control_horizon=1. Model, cost function, candidate grid, move limits,
+    constraint handling, backoff, offset-free correction and the soft
+    fallback are all shared. Horizon length is the only difference, so the
+    2x2 ablation in ABLATIONS separates horizon length from model structure
+    with nothing else varying.
+
+    Constraints are applied in three tiers. The hard pressure limits are
+    enforced over the whole prediction horizon. The backoff margin is
+    enforced only from backoff_start onward, defaulting to half the horizon,
+    because BHP has a 12.3 h time constant and cannot recover a 15 psi
+    margin within one interval; demanding it immediately would make the
+    backoff tier permanently infeasible and collapse the controller onto the
+    zero-margin limit. If no candidate satisfies the hard limits the
+    controller switches to a soft mode that minimises weighted predicted
+    violation instead of tracking error, so it degrades rather than throwing.
+
+    backoff_start is derived from the horizon by the same rule for every
+    configuration, so the one-step baseline is not handicapped by it. It does
+    mean a one-step controller has less opportunity to satisfy the backoff
+    tier, which is a real consequence of the short horizon and is exactly
+    what the ablation is meant to expose.
+    """
+
+    def __init__(self, config=None, models=None):
+        self.config = config or MPCConfig()
+        self.models = models or build_models(self.config.structure, self.config.ts)
+        self._alpha = {
+            k: 1.0 - math.exp(-self.config.ts / max(self.models[k].tau, 1e-6))
+            for k in OUTPUTS
+        }
+        self._candidates = self._build_candidates()
+        self.u_prev = 0.0
+        self._x = None
+        self._bias = {k: 0.0 for k in OUTPUTS}
+        self.last_info = {}
+
+    def _build_candidates(self):
+        g = max(2, self.config.grid_points)
+        grid = np.linspace(-limits.CHOKE_MAX_MOVE, limits.CHOKE_MAX_MOVE, g)
+        m = self.config.control_horizon
+        mesh = np.meshgrid(*([grid] * m), indexing="ij")
+        return np.stack([a.ravel() for a in mesh], axis=1)
+
+    def reset(self, u0, measurement=None):
+        self.u_prev = float(u0)
+        if measurement is None:
+            self._x = {k: float(self.models[k].steady(u0)) for k in OUTPUTS}
+        else:
+            self._x = dict(zip(OUTPUTS, [float(v) for v in measurement]))
+        self._bias = {k: 0.0 for k in OUTPUTS}
+        self.last_info = {}
+        return self.u_prev
+
+    def _u_trajectory(self, cand):
+        n = cand.shape[0]
+        m = self.config.control_horizon
+        moves = np.cumsum(cand, axis=1) + self.u_prev
+        moves = np.clip(moves, limits.CHOKE_MIN, limits.CHOKE_MAX)
+        traj = np.empty((n, self.config.horizon))
+        traj[:, :m] = moves[:, : min(m, self.config.horizon)]
+        if self.config.horizon > m:
+            traj[:, m:] = moves[:, -1][:, None]
+        return traj
+
+    def _predict(self, traj):
+        n, h = traj.shape
+        preds = {}
+        for k in OUTPUTS:
+            model = self.models[k]
+            a = self._alpha[k]
+            x = np.full(n, self._x[k], dtype=float)
+            out = np.empty((n, h))
+            for j in range(h):
+                x = x + a * (np.asarray(model.steady(traj[:, j]), dtype=float) - x)
+                out[:, j] = x
+            preds[k] = out + self._bias[k]
+        return preds
+
+    def _feasible_mask(self, preds, backoff, start=0):
+        mask = np.ones(preds["Q"].shape[0], dtype=bool)
+        for k in PRESSURES:
+            thr = limits.PRESSURE_LIMITS[k] + backoff.get(k, 0.0)
+            mask &= np.all(preds[k][:, start:] >= thr, axis=1)
+        return mask
+
+    def _tracking_cost(self, preds, cand, target):
+        err = preds["Q"] - target
+        return np.sum(err * err, axis=1) + self.config.move_weight * np.sum(
+            cand * cand, axis=1
+        )
+
+    def _violation_cost(self, preds, cand):
+        total = np.zeros(preds["Q"].shape[0])
+        for k in PRESSURES:
+            short = np.maximum(limits.PRESSURE_LIMITS[k] - preds[k], 0.0)
+            total += self.config.soft_weight.get(k, 1.0) * np.sum(short * short, axis=1)
+        return total + self.config.soft_move_weight * np.sum(cand * cand, axis=1)
+
+    def compute(self, measurement, target):
+        meas = dict(zip(OUTPUTS, [float(v) for v in measurement]))
+        if self._x is None:
+            self._x = dict(meas)
+        for k in OUTPUTS:
+            self._bias[k] = meas[k] - self._x[k]
+
+        cand = self._candidates
+        traj = self._u_trajectory(cand)
+        preds = self._predict(traj)
+
+        zero_backoff = {k: 0.0 for k in PRESSURES}
+        tiers = (
+            ("hard+backoff", self.config.backoff, self.config.backoff_start),
+            ("hard", zero_backoff, 0),
+        )
+        chosen = None
+        for tier_name, bo, start in tiers:
+            mask = self._feasible_mask(preds, bo, start)
+            if np.any(mask):
+                cost = self._tracking_cost(preds, cand, target)
+                cost = np.where(mask, cost, np.inf)
+                idx = int(np.argmin(cost))
+                chosen = (tier_name, idx, int(mask.sum()), float(cost[idx]))
+                break
+        if chosen is None:
+            cost = self._violation_cost(preds, cand)
+            idx = int(np.argmin(cost))
+            chosen = ("soft", idx, 0, float(cost[idx]))
+
+        tier_name, idx, n_feasible, cost = chosen
+        u = float(traj[idx, 0])
+        u = limits.clamp_choke(u, self.u_prev)
+
+        pred_min = {k: float(np.min(preds[k][idx])) for k in PRESSURES}
+        self.last_info = {
+            "mode": tier_name,
+            "n_feasible": n_feasible,
+            "n_candidates": int(cand.shape[0]),
+            "cost": cost,
+            "u_prev": self.u_prev,
+            "u": u,
+            "du": u - self.u_prev,
+            "target": float(target),
+            "predicted_q_end": float(preds["Q"][idx, -1]),
+            "predicted_min": pred_min,
+            "bias": dict(self._bias),
+            "soft": tier_name == "soft",
+        }
+
+        for k in OUTPUTS:
+            self._x[k] = self._x[k] + self._alpha[k] * (
+                float(self.models[k].steady(u)) - self._x[k]
+            )
+        self.u_prev = u
+        return u
+
+
+def make_controller(key, **overrides):
+    if key not in ABLATIONS:
+        raise KeyError(f"unknown ablation {key!r}; options: {sorted(ABLATIONS)}")
+    base = ABLATIONS[key]
+    cfg = MPCConfig(
+        horizon=overrides.get("horizon", base.horizon),
+        control_horizon=overrides.get("control_horizon", base.control_horizon),
+        move_weight=overrides.get("move_weight", base.move_weight),
+        structure=overrides.get("structure", base.structure),
+        grid_points=overrides.get("grid_points", base.grid_points),
+        backoff=dict(overrides.get("backoff", base.backoff)),
+        backoff_start=overrides.get("backoff_start", None),
+        soft_weight=dict(overrides.get("soft_weight", base.soft_weight)),
+        soft_move_weight=overrides.get("soft_move_weight", base.soft_move_weight),
+        ts=overrides.get("ts", base.ts),
+        name=overrides.get("name", base.name),
+    )
+    return ChokeMPC(cfg)
+
+
+def naive_controller(structure="saturating", **overrides):
+    overrides.setdefault("name", f"one-step h=1, {structure}")
+    return make_controller(
+        "mpc_h1_sat" if structure == "saturating" else "mpc_h1_lin", **overrides
+    )
