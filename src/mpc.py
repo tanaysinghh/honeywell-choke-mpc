@@ -103,13 +103,15 @@ def backoff_production_cost(models=None, backoff=None):
 class MPCConfig:
     horizon: int = 12
     control_horizon: int = 3
-    move_weight: float = 2.0
+    move_weight: float = 1.0
     structure: str = "saturating"
     grid_points: int = 11
     backoff: dict = field(default_factory=lambda: dict(DEFAULT_BACKOFF))
     backoff_start: int = None
     soft_weight: dict = field(default_factory=lambda: dict(DEFAULT_SOFT_WEIGHT))
     soft_move_weight: float = 0.01
+    bias_gain: float = 0.3
+    ss_feasible_inputs: bool = True
     ts: float = limits.TS_HOURS
     name: str = "mpc"
 
@@ -122,14 +124,22 @@ class MPCConfig:
 
 ABLATIONS = {
     "mpc_h12_sat": MPCConfig(horizon=12, control_horizon=3, structure="saturating",
-                             name="MPC h=12, saturating"),
+                             ss_feasible_inputs=False, name="MPC h=12, saturating"),
     "mpc_h1_sat": MPCConfig(horizon=1, control_horizon=1, structure="saturating",
-                            name="one-step h=1, saturating"),
+                            ss_feasible_inputs=False, name="one-step h=1, saturating"),
     "mpc_h12_lin": MPCConfig(horizon=12, control_horizon=3, structure="fopdt",
-                             name="MPC h=12, linear FOPDT"),
+                             ss_feasible_inputs=False, name="MPC h=12, linear FOPDT"),
     "mpc_h1_lin": MPCConfig(horizon=1, control_horizon=1, structure="fopdt",
-                            name="naive h=1, linear FOPDT"),
+                            ss_feasible_inputs=False, name="naive h=1, linear FOPDT"),
 }
+
+PRODUCTION = MPCConfig(
+    horizon=12,
+    control_horizon=3,
+    structure="saturating",
+    ss_feasible_inputs=True,
+    name="MPC h=12, saturating + SS-feasible inputs",
+)
 
 
 class ChokeMPC:
@@ -161,6 +171,44 @@ class ChokeMPC:
     mean a one-step controller has less opportunity to satisfy the backoff
     tier, which is a real consequence of the short horizon and is exactly
     what the ablation is meant to expose.
+
+    ss_feasible_inputs is kept OFF in the four ABLATIONS cells, so that the
+    2x2 varies horizon and model structure and nothing else. It is itself a
+    form of long-range reasoning - a steady-state, i.e. infinite-horizon,
+    admissibility test on each candidate input - so switching it on inside a
+    horizon=1 cell would smuggle the very information the ablation is trying
+    to isolate. It is reported instead as an explicit third axis, and the
+    shipped controller is PRODUCTION, which has it on.
+
+    Two additions keep the specified horizon of 12 usable. The horizon is
+    only 0.97 x tau_BHP, so a 12-step prediction does not reach the steady
+    state a candidate choke position implies; without help the controller
+    opens to 84% during startup, sees no violation inside the window, and
+    then has to retreat. ss_feasible_inputs therefore restricts candidates
+    to inputs that are also feasible at steady state. Constraining only the
+    terminal input is not enough: under a receding horizon the controller
+    opens wide now and plans to close later, never executes the close, and
+    the choke zigzags on the move limit. Requiring every planned input to be
+    steady-state feasible cuts total choke travel about fivefold on the
+    infeasible scenario at a ~1.5% production cost, and leaves the feasible
+    scenarios unchanged because the restriction only binds near the limit.
+
+    bias_gain low-pass filters the offset-free disturbance estimate; taking
+    the raw one-step innovation makes the estimated constraint boundary jump
+    with every noisy sample and the choke chatters against it.
+
+    Both apply identically to every configuration including the one-step
+    baseline.
+
+    move_weight is deliberately low. A move penalty is asymmetric across
+    horizons: a one-step controller sees only the first interval of a move's
+    benefit (about 20% of it for oil rate) while paying the full penalty, so
+    a weight tuned for the long horizon silently disables the short one. The
+    horizon-12 cost is flat in this parameter (IAE 334-351 over move_weight
+    0.5 to 20, with the infeasible scenario unchanged), so nothing is gained
+    by raising it, while the one-step baseline stops tracking above about 2.
+    At 1.0 both are near their best and the one-step cell actually settles
+    scenario A faster than the horizon-12 cell.
     """
 
     def __init__(self, config=None, models=None):
@@ -218,11 +266,14 @@ class ChokeMPC:
             preds[k] = out + self._bias[k]
         return preds
 
-    def _feasible_mask(self, preds, backoff, start=0):
+    def _feasible_mask(self, preds, backoff, start=0, u_plan=None):
         mask = np.ones(preds["Q"].shape[0], dtype=bool)
         for k in PRESSURES:
             thr = limits.PRESSURE_LIMITS[k] + backoff.get(k, 0.0)
             mask &= np.all(preds[k][:, start:] >= thr, axis=1)
+            if u_plan is not None:
+                ss = np.asarray(self.models[k].steady(u_plan), dtype=float)
+                mask &= np.all(ss + self._bias[k] >= thr, axis=1)
         return mask
 
     def _tracking_cost(self, preds, cand, target):
@@ -242,12 +293,14 @@ class ChokeMPC:
         meas = dict(zip(OUTPUTS, [float(v) for v in measurement]))
         if self._x is None:
             self._x = dict(meas)
+        g = self.config.bias_gain
         for k in OUTPUTS:
-            self._bias[k] = meas[k] - self._x[k]
+            self._bias[k] += g * ((meas[k] - self._x[k]) - self._bias[k])
 
         cand = self._candidates
         traj = self._u_trajectory(cand)
         preds = self._predict(traj)
+        u_plan = traj if self.config.ss_feasible_inputs else None
 
         zero_backoff = {k: 0.0 for k in PRESSURES}
         tiers = (
@@ -256,7 +309,7 @@ class ChokeMPC:
         )
         chosen = None
         for tier_name, bo, start in tiers:
-            mask = self._feasible_mask(preds, bo, start)
+            mask = self._feasible_mask(preds, bo, start, u_plan)
             if np.any(mask):
                 cost = self._tracking_cost(preds, cand, target)
                 cost = np.where(mask, cost, np.inf)
@@ -308,6 +361,10 @@ def make_controller(key, **overrides):
         grid_points=overrides.get("grid_points", base.grid_points),
         backoff=dict(overrides.get("backoff", base.backoff)),
         backoff_start=overrides.get("backoff_start", None),
+        bias_gain=overrides.get("bias_gain", base.bias_gain),
+        ss_feasible_inputs=overrides.get(
+            "ss_feasible_inputs", base.ss_feasible_inputs
+        ),
         soft_weight=dict(overrides.get("soft_weight", base.soft_weight)),
         soft_move_weight=overrides.get("soft_move_weight", base.soft_move_weight),
         ts=overrides.get("ts", base.ts),

@@ -1,0 +1,4 @@
+controller,scenario,settling_time_h,iae,total_production_bbl,final_rate,final_choke,total_move,soft_steps,viol_true,viol_true_rate,viol_true_maxdepth,viol_true_longest_run,viol_true_first,min_bhp_true,viol_measured,viol_measured_rate,viol_measured_maxdepth,viol_measured_longest_run,viol_measured_first,min_bhp_measured
+"MPC h=12, saturating + SS-feasible inputs",A,9.0,329.49340710494926,17763.3089616987,119.65642698131361,43.7,64.0,0,0,0.0,0.0,0,-1,3041.8384849415565,0,0.0,0.0,0,-1,3030.864983277858
+"MPC h=12, saturating + SS-feasible inputs",B,11.0,366.98643778519994,24717.908347260185,149.33410104389606,60.40000000000002,72.0,0,0,0.0,0.0,0,-1,2904.6539823716785,0,0.0,0.0,0,-1,2896.6214739609377
+"MPC h=12, saturating + SS-feasible inputs",C,,8647.788789635433,31352.211210364567,158.15656937844216,65.75,69.0,0,0,0.0,0.0,0,-1,2864.025806328547,0,0.0,0.0,0,-1,2854.2978907465967
