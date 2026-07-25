@@ -36,6 +36,9 @@ SHORT = {
     "mpc_h12_lin": "MPC h=12, linear",
     "mpc_h1_lin": "naive h=1, linear",
 }
+SHIPPED_CELL = "MPC h=12, saturating"
+ABLATION_ORDER = ("MPC h=12, saturating", "MPC h=12, linear",
+                  "one-step h=1, saturating", "naive h=1, linear")
 
 
 def tweak(cfg, **kw):
@@ -90,10 +93,18 @@ def fmt(v, spec, nan="n/a"):
 
 
 def table_png(df, path):
-    header = ["scenario", "controller", "backoff", "SS-feas", "settle\n[h]",
+    header = ["scenario", "controller", "SS-feas", "settle\n[h]",
               "IAE\n[bbl/hr*h]", "prod\n[bbl]", "viol\nTRUE", "viol\nMEAS",
               "min BHP\ntrue [psi]"]
-    sub = df[(df["backoff"] != "zero")].reset_index(drop=True)
+    keep = (df["backoff"] != "zero") & (
+        (~df["ss_feasible"])
+        | (df["ss_feasible"] & (df["controller"] == SHIPPED_CELL))
+    )
+    sub = df[keep].copy()
+    sub["controller"] = np.where(
+        sub["ss_feasible"] & (sub["controller"] == SHIPPED_CELL),
+        SHIPPED_CELL + "  [SHIPPED]", sub["controller"])
+    sub = sub.reset_index(drop=True)
     cells, colors = [], []
     for _, r in sub.iterrows():
         settle = r["settling_time_h"]
@@ -102,7 +113,7 @@ def table_png(df, path):
         ss_txt = "-" if r["controller"].startswith("PI") else (
             "on" if r["ss_feasible"] else "off")
         cells.append([
-            r["scenario"], r["controller"], r["backoff"], ss_txt, settle_txt,
+            r["scenario"], r["controller"], ss_txt, settle_txt,
             f"{r['iae']:.0f}", f"{r['total_production_bbl']:.0f}",
             f"{vt:.1f}", f"{r['viol_measured']:.1f}",
             f"{r['min_bhp_true']:.1f}",
@@ -115,10 +126,11 @@ def table_png(df, path):
             tone = "#fbe9e9"
         colors.append([tone] * len(header))
 
-    fig, ax = plt.subplots(figsize=(14.5, 0.36 * len(cells) + 1.6))
+    widths = [0.055, 0.20, 0.065, 0.085, 0.10, 0.085, 0.075, 0.075, 0.095]
+    fig, ax = plt.subplots(figsize=(13.5, 0.30 * len(cells) + 1.1))
     ax.axis("off")
     tbl = ax.table(cellText=cells, colLabels=header, cellColours=colors,
-                   loc="center", cellLoc="center")
+                   colWidths=widths, loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8.5)
     tbl.scale(1, 1.45)
@@ -130,11 +142,62 @@ def table_png(df, path):
         for j in range(len(header)):
             tbl[i, j].set_edgecolor("#cfcfcb")
     ax.set_title(
-        f"MPC vs one-step vs PI  -  mean of {len(list(SEEDS))} seeds per cell "
-        "(default backoff; zero-backoff rows in the CSV)\n"
-        "green: no true violations   amber: <10   red: >=10",
-        fontsize=11, pad=18,
+        f"MPC vs one-step vs PI  -  default backoff, mean of {len(list(SEEDS))} "
+        "seeds per cell\n"
+        "green: no true violations   amber: <10   red: >=10        "
+        "zero-backoff fairness evidence: figures/04c_fairness_zero_backoff.png",
+        fontsize=10.5, pad=14,
     )
+    fig.tight_layout()
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fairness_figure(df, path):
+    c = df[(df["scenario"] == "C") & (~df["ss_feasible"])]
+    off = {r["controller"]: r["viol_true"]
+           for _, r in c[c["backoff"] == "zero"].iterrows()}
+    on = {r["controller"]: r["viol_true"]
+          for _, r in c[c["backoff"] == "default"].iterrows()}
+    names = list(ABLATION_ORDER)
+    x = np.arange(len(names))
+    w = 0.36
+
+    fig, ax = plt.subplots(figsize=(8.6, 4.6))
+    b1 = ax.bar(x - w / 2, [off[n] for n in names], w, color=C_NAIVE, alpha=0.9,
+                label="no backoff margin", zorder=3)
+    b2 = ax.bar(x + w / 2, [on[n] for n in names], w, color=C_MPC, alpha=0.95,
+                label="15 psi backoff margin", zorder=3)
+    for bars in (b1, b2):
+        for rect in bars:
+            h = rect.get_height()
+            ax.annotate(f"{h:.1f}", xy=(rect.get_x() + rect.get_width() / 2, h),
+                        xytext=(0, 3), textcoords="offset points", ha="center",
+                        fontsize=9.5, weight="bold", color=C_INK)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([n.replace(", ", ",\n") for n in names], fontsize=9.5)
+    ax.set_ylabel("BHP violations [true, of 200]", fontsize=10)
+    ax.set_ylim(0, 128)
+    ax.set_title("The backoff is not what makes the long horizon win\n"
+                 "Remove it from every controller and h=12 is still safer than h=1",
+                 fontsize=11.5, weight="bold", color=C_INK, pad=12)
+    ax.legend(fontsize=9.5, frameon=False, loc="upper center", ncol=2)
+    fig.text(0.5, -0.02,
+             "With no margin anywhere, h=12 beats h=1 (90 vs 104), so the backoff "
+             "rule is not what produces the gap.\n"
+             "Adding the margin changes h=1 by 1 % and h=12 by 99.8 %: only a long "
+             "horizon can actuate a 15 psi\nmargin on a 12.3 h time constant. "
+             "Scenario C, mean of 5 seeds, steady-state feasibility off in all four "
+             "cells.",
+             ha="center", va="top", fontsize=9, color=C_MUTED, linespacing=1.7)
+    ax.grid(alpha=0.2, lw=0.7, axis="y")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color("#cfcfcb")
+    ax.tick_params(labelsize=9, color="#cfcfcb")
     fig.tight_layout()
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -225,10 +288,12 @@ def main():
 
     table_png(df, FIG_DIR / "04_metrics_table.png")
     headline_figure(FIG_DIR / "04_headline_scenarioC_bhp.png")
+    fairness_figure(df, FIG_DIR / "04c_fairness_zero_backoff.png")
 
     print(f"\nwrote {csv}")
     print(f"wrote {FIG_DIR / '04_metrics_table.png'}")
     print(f"wrote {FIG_DIR / '04_headline_scenarioC_bhp.png'}")
+    print(f"wrote {FIG_DIR / '04c_fairness_zero_backoff.png'}")
 
     c = df[df["scenario"] == "C"]
     for ss in (False, True):
