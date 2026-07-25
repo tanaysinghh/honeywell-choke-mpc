@@ -24,6 +24,7 @@ IDENTIFIED_FOPDT = {
 
 DEFAULT_BACKOFF = {"WHP": 5.0, "FLP": 5.0, "BHP": 15.0}
 DEFAULT_SOFT_WEIGHT = {"WHP": 1.0, "FLP": 1.0, "BHP": 1.0}
+BACKOFF_START_HOURS = 6.0
 
 
 def build_models(structure="saturating", ts=limits.TS_HOURS):
@@ -118,8 +119,8 @@ class MPCConfig:
     def __post_init__(self):
         self.control_horizon = max(1, min(self.control_horizon, self.horizon))
         if self.backoff_start is None:
-            self.backoff_start = min(self.horizon - 1, max(0, self.horizon // 2))
-        self.backoff_start = min(max(0, self.backoff_start), self.horizon - 1)
+            self.backoff_start = int(round(BACKOFF_START_HOURS / self.ts))
+        self.backoff_start = min(max(0, self.backoff_start), max(0, self.horizon - 1))
 
 
 ABLATIONS = {
@@ -157,20 +158,35 @@ class ChokeMPC:
     with nothing else varying.
 
     Constraints are applied in three tiers. The hard pressure limits are
-    enforced over the whole prediction horizon. The backoff margin is
-    enforced only from backoff_start onward, defaulting to half the horizon,
-    because BHP has a 12.3 h time constant and cannot recover a 15 psi
-    margin within one interval; demanding it immediately would make the
-    backoff tier permanently infeasible and collapse the controller onto the
-    zero-margin limit. If no candidate satisfies the hard limits the
-    controller switches to a soft mode that minimises weighted predicted
-    violation instead of tracking error, so it degrades rather than throwing.
+    enforced over every step of the prediction horizon in all tiers,
+    including the backoff tier. Only the extra backoff margin is windowed,
+    enforced from backoff_start onward, because BHP has a 12.3 h time
+    constant and cannot recover a 15 psi margin within one interval;
+    demanding the margin immediately would make the backoff tier permanently
+    infeasible and collapse the controller onto the zero-margin limit. The
+    limit itself is actuatable at every step and so is never windowed. If no
+    candidate satisfies the hard limits the controller switches to a soft
+    mode that minimises weighted predicted violation instead of tracking
+    error, so it degrades rather than throwing.
 
-    backoff_start is derived from the horizon by the same rule for every
-    configuration, so the one-step baseline is not handicapped by it. It does
-    mean a one-step controller has less opportunity to satisfy the backoff
-    tier, which is a real consequence of the short horizon and is exactly
-    what the ablation is meant to expose.
+    Windowing the limit rather than the margin is a subtle and severe error.
+    A tier that skips the first backoff_start steps leaves them entirely
+    unconstrained whenever that tier is satisfiable, and the ladder never
+    reaches the stricter tier because the looser one already succeeded. If
+    backoff_start is additionally tied to the horizon the hole widens as the
+    horizon grows, and prediction length becomes actively harmful: at
+    horizon 36 with a half-horizon window the controller held a choke whose
+    steady BHP was 2795 psi for the whole run, 166 of 200 samples in
+    violation, while every plan it evaluated looked feasible.
+
+    backoff_start is therefore a fixed physical quantity, not a fraction of
+    the horizon: BACKOFF_START_HOURS is the time BHP needs to recover the
+    margin after a full-rate close, about 6 h for a 15 psi margin given a
+    -8.4 psi/% gain, a 5%/interval move limit and tau 12.3 h. It is the same
+    number of steps for every configuration, so no cell is handicapped, and
+    it is clamped to horizon-1 so a one-step controller must satisfy the
+    margin immediately - a real consequence of the short horizon, and
+    exactly what the ablation is meant to expose.
 
     ss_feasible_inputs is kept OFF in the four ABLATIONS cells, so that the
     2x2 varies horizon and model structure and nothing else. It is itself a
@@ -269,11 +285,14 @@ class ChokeMPC:
     def _feasible_mask(self, preds, backoff, start=0, u_plan=None):
         mask = np.ones(preds["Q"].shape[0], dtype=bool)
         for k in PRESSURES:
-            thr = limits.PRESSURE_LIMITS[k] + backoff.get(k, 0.0)
-            mask &= np.all(preds[k][:, start:] >= thr, axis=1)
+            lim = limits.PRESSURE_LIMITS[k]
+            bo = backoff.get(k, 0.0)
+            mask &= np.all(preds[k] >= lim, axis=1)
+            if bo > 0.0 and start < preds[k].shape[1]:
+                mask &= np.all(preds[k][:, start:] >= lim + bo, axis=1)
             if u_plan is not None:
                 ss = np.asarray(self.models[k].steady(u_plan), dtype=float)
-                mask &= np.all(ss + self._bias[k] >= thr, axis=1)
+                mask &= np.all(ss + self._bias[k] >= lim + bo, axis=1)
         return mask
 
     def _tracking_cost(self, preds, cand, target):
