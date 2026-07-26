@@ -5,6 +5,28 @@ well. The controller chooses a choke position once an hour to maximise oil rate
 without ever taking WHP, FLP or BHP below its limit. Control interval
 `Ts = 1 h`, choke `0-100 %`, slew limit `±5 %` per interval.
 
+<details>
+<summary><strong>Contents</strong></summary>
+
+- [Results](#results) - headline numbers, the headline case, and the three findings
+- [Setup and reproduction](#setup-and-reproduction) - install, run, expected runtime
+- [Substituting the official simulator](#substituting-the-official-simulator) - the one import change and the conformance test
+- [Plant interface](#plant-interface)
+- [Identified model](#identified-model) - which BHP gain is which, and held-out validation
+- [Operating envelope](#operating-envelope) - the 163 bbl/hr ceiling
+- [Controller](#controller) - constraint ladder, backoff, baseline fairness
+- [Scenario results](#scenario-results) - A, B, C and the ablation table
+- [Findings](#findings) - the seven results the design rests on
+- [Step-test design](#step-test-design)
+- [Robustness](#robustness) - Monte Carlo and the mismatch envelope
+- [Sensitivity to the assumed pressure limits](#sensitivity-to-the-assumed-pressure-limits)
+- [Conformance to the eight Simulator Assumptions](#conformance-to-the-eight-simulator-assumptions)
+- [Outputs](#outputs) - figures and data files
+- [Stages](#stages) - what each script produces
+- [Source layout](#source-layout)
+
+</details>
+
 ## Results
 
 | | |
@@ -106,7 +128,7 @@ jupyter nbconvert --to notebook --execute --inplace \
 
 ## Substituting the official simulator
 
-The official simulator was not released before this submission round, so
+The official simulator is released after this submission round, so
 `src/plant.py` is a behavioural surrogate calibrated to
 `data/reference_steptest.csv`. Every controller is written against one
 interface only:
@@ -293,8 +315,9 @@ All three pressure constraints are **lower** limits.
 > **The numeric values 200 / 145 / 2850 psi are an assumption of this
 > submission.** The problem statement names WHP, FLP and BHP as active
 > constraints and refers to "WHP limits, FLP limits, BHP limits" but gives no
-> numbers anywhere; they were presumably carried in the simulator that was
-> never released. Because every result below depends on them,
+> numbers anywhere; they are presumably carried in the simulator, which is
+> released after this submission round. Because every result below depends on
+> them,
 > `run_06_limit_sensitivity.py` sweeps each one independently and re-runs the
 > shipped controller unmodified at every point - see
 > [Sensitivity to the assumed pressure limits](#sensitivity-to-the-assumed-pressure-limits).
@@ -758,7 +781,7 @@ condition without polling a separate function.
 ## Conformance to the eight Simulator Assumptions
 
 The problem statement's Simulator Assumptions are the closest thing to a
-specification available for a simulator that was never released, so conformance
+specification available ahead of the simulator's release, so conformance
 to them is part of the defence of the surrogate. Verified in
 `notebook/Autonomous_Choke_Control.ipynb`, Appendix A (executed, with output).
 

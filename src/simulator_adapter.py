@@ -1,6 +1,6 @@
 """Adapter and conformance test for the official simulator.
 
-The official simulator was not released before this submission round. Every
+The official simulator is released after this submission round. Every
 controller in this repository is written against one interface only:
 
     Q, WHP, FLP, BHP = simulator.step(choke_position)
