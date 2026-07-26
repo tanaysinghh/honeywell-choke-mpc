@@ -71,16 +71,25 @@ python run_all.py
 elapsed time per stage, and reports the total. Per-stage console output goes to
 `data/logs/`.
 
-**Expected runtime: about 11 minutes** on a laptop (measured: 11 m 06 s, Python
-3.12, 8-core Windows). Two stages dominate:
+**Expected runtime: 15-20 minutes** on a Windows laptop, Python 3.12. Two
+end-to-end measurements: **14 m 52 s**, and **17 m 40 s** for a clean-room run
+in a freshly created venv. Both machines had other work running, so treat these
+as an upper bound rather than a benchmark. Two stages are ~90 % of the total:
 
-| stage | what it does | runtime |
-|---|---|---|
-| `run_05_montecarlo.py` | 700 Monte Carlo runs + mismatch envelope | ~4 m |
-| `run_06_limit_sensitivity.py` | 31 limit sets x 3 scenarios x 5 seeds | ~2 m |
-| `run_04_baseline_compare.py` | ablation + PI, 5 seeds | ~2 m |
-| `run_04b_horizon_sweep.py` | horizons 1-60 | ~2 m |
-| `run_01/02/03` | step tests, identification, scenarios | ~1 m combined |
+| stage | what it does | measured | share |
+|---|---|---|---|
+| `run_05_montecarlo.py` | 700 Monte Carlo runs + mismatch envelope | 9 m 52 s | 66 % |
+| `run_06_limit_sensitivity.py` | 31 limit sets x 3 scenarios x 5 seeds | 3 m 58 s | 27 % |
+| `run_04b_horizon_sweep.py` | horizons 1-60, 2 scenarios, 5 seeds | 32 s | 4 % |
+| `run_04_baseline_compare.py` | ablation + PI, 5 seeds | 23 s | 3 % |
+| `run_03_scenarios.py` | scenarios A, B, C | 3 s | <1 % |
+| `run_02_identify.py` | fit + held-out validation | 2 s | <1 % |
+| `run_01_steptest.py` | step tests + gain-bias sweep | 2 s | <1 % |
+
+**To see the substance in under a minute, run stages 1-4 only** — they produce
+the identification, the scenarios, the headline figure and the metrics table.
+Stages 5-7 are the evidence-base sweeps that justify the claims but reproduce
+numbers already committed in `data/`.
 
 Individual stages can be run on their own in the same order; each writes its own
 figures and CSVs and depends only on the data files written before it.
