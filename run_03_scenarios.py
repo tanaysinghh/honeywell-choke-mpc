@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 import limits
 from evaluate import SCENARIOS, metrics, run_closed_loop
-from mpc import PRODUCTION, ChokeMPC, backoff_production_cost
+from mpc import PRODUCTION, ChokeMPC, backoff_production_cost, infeasibility_report
 
 DATA_DIR = ROOT / "data"
 FIG_DIR = ROOT / "figures"
@@ -139,6 +139,9 @@ def main():
         st_txt = "not reached" if np.isnan(st) else f"{st:.0f} h"
         print(f"\n--- Scenario {sc.name} ---")
         print(f"  {sc.description}")
+        adv = infeasibility_report(sc.targets[-1], backoff=cfg.backoff)
+        if adv is not None:
+            print(f"  ADVISORY: {adv['message']}")
         print(f"  settling to +/-2% of target : {st_txt}")
         print(f"  IAE                         : {m['iae']:.1f} bbl/hr*h")
         print(f"  final rate / choke          : {m['final_rate']:.2f} bbl/hr "

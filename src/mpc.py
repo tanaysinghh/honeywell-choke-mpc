@@ -81,6 +81,111 @@ def max_feasible_choke(models, backoff=None, lo=0.0, hi=100.0, tol=1e-4):
     return lo
 
 
+def binding_choke(model, limit, lo=0.0, hi=100.0, tol=1e-5):
+    """Choke position at which a falling pressure output reaches its limit.
+
+    NaN when the constraint never binds anywhere in the choke range.
+    """
+    if float(model.steady(hi)) >= limit:
+        return float("nan")
+    if float(model.steady(lo)) <= limit:
+        return lo
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if float(model.steady(mid)) > limit:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def binding_chokes(models=None):
+    models = models or build_models("saturating")
+    return {
+        k: binding_choke(models[k], limits.PRESSURE_LIMITS[k])
+        for k in PRESSURES
+    }
+
+
+def rate_ceiling(models=None, backoff=None):
+    """Maximum steady oil rate admissible under the current pressure limits.
+
+    Reports which constraint is responsible as well as the rate, so an
+    operator is told why the well is capped and not merely that it is. Every
+    limit is read from limits.PRESSURE_LIMITS at call time rather than
+    captured at import, so changing a limit moves the reported ceiling and the
+    reported binding constraint with no retuning anywhere.
+    """
+    models = models or build_models("saturating")
+    backoff = dict(backoff or {})
+    u = max_feasible_choke(models, backoff)
+    margin = {
+        k: float(models[k].steady(u)) - limits.PRESSURE_LIMITS[k] - backoff.get(k, 0.0)
+        for k in PRESSURES
+    }
+    binding = min(PRESSURES, key=lambda k: margin[k])
+    wide_open = u >= limits.CHOKE_MAX - 1e-6 and margin[binding] > 1e-6
+    return {
+        "choke": u,
+        "rate": float(models["Q"].steady(u)),
+        "binding": None if wide_open else binding,
+        "binding_limit": None if wide_open else limits.PRESSURE_LIMITS[binding],
+        "binding_backoff": 0.0 if wide_open else backoff.get(binding, 0.0),
+        "margin": margin,
+    }
+
+
+def infeasibility_report(target, models=None, backoff=None, tol=1e-3):
+    """Operator-facing advisory for a target the well cannot deliver.
+
+    None when the target is achievable. Otherwise it states the achievable
+    rate and the constraint responsible, at the hard limit and again under the
+    controller's backoff policy, because those are different numbers: the
+    first is what the well can physically give, the second is what the
+    controller will actually hold. An operator asking why a 200 bbl/hr request
+    is producing 161 needs both, and needs the constraint named rather than
+    having to infer it from which pressure trace is flattest.
+    """
+    models = models or build_models("saturating")
+    backoff = DEFAULT_BACKOFF if backoff is None else backoff
+    hard = rate_ceiling(models, None)
+    held = rate_ceiling(models, backoff)
+    target = float(target)
+    if target <= hard["rate"] + tol:
+        return None
+
+    if hard["binding"] is None:
+        head = (f"Target {target:.1f} bbl/hr infeasible. Maximum rate "
+                f"{hard['rate']:.2f} bbl/hr at a fully open choke; no pressure "
+                f"constraint is active.")
+    else:
+        head = (f"Target {target:.1f} bbl/hr infeasible. Maximum safe rate "
+                f"{hard['rate']:.2f} bbl/hr, limited by {hard['binding']} at "
+                f"{hard['binding_limit']:.0f} psi.")
+    if held["binding"] is None:
+        tail = (f"Controller will hold {held['rate']:.2f} bbl/hr at "
+                f"{held['choke']:.2f} % choke.")
+    else:
+        tail = (f"Controller will hold {held['rate']:.2f} bbl/hr at "
+                f"{held['choke']:.2f} % choke, keeping a "
+                f"{held['binding_backoff']:.0f} psi {held['binding']} backoff "
+                f"margin.")
+    return {
+        "target": target,
+        "achievable_rate": hard["rate"],
+        "achievable_choke": hard["choke"],
+        "binding": hard["binding"],
+        "binding_limit": hard["binding_limit"],
+        "held_rate": held["rate"],
+        "held_choke": held["choke"],
+        "held_binding": held["binding"],
+        "shortfall": target - hard["rate"],
+        "message": head + " " + tail,
+    }
+
+
 def backoff_production_cost(models=None, backoff=None):
     models = models or build_models("saturating")
     backoff = DEFAULT_BACKOFF if backoff is None else backoff
@@ -239,6 +344,7 @@ class ChokeMPC:
         self._x = None
         self._bias = {k: 0.0 for k in OUTPUTS}
         self.last_info = {}
+        self._ceiling = rate_ceiling(self.models, None)
 
     def _build_candidates(self):
         g = max(2, self.config.grid_points)
@@ -255,7 +361,11 @@ class ChokeMPC:
             self._x = dict(zip(OUTPUTS, [float(v) for v in measurement]))
         self._bias = {k: 0.0 for k in OUTPUTS}
         self.last_info = {}
+        self._ceiling = rate_ceiling(self.models, None)
         return self.u_prev
+
+    def infeasibility(self, target):
+        return infeasibility_report(target, self.models, self.config.backoff)
 
     def _u_trajectory(self, cand):
         n = cand.shape[0]
@@ -358,6 +468,9 @@ class ChokeMPC:
             "predicted_min": pred_min,
             "bias": dict(self._bias),
             "soft": tier_name == "soft",
+            "target_infeasible": float(target) > self._ceiling["rate"] + 1e-3,
+            "rate_ceiling": self._ceiling["rate"],
+            "ceiling_binding": self._ceiling["binding"],
         }
 
         for k in OUTPUTS:

@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 
 TS_HOURS = 1.0
@@ -42,6 +43,35 @@ class Margins:
 
     def as_dict(self):
         return {"WHP": self.whp, "FLP": self.flp, "BHP": self.bhp}
+
+
+@contextlib.contextmanager
+def override(**values):
+    """Temporarily install a different set of numeric pressure limits.
+
+    The numeric values 200 / 145 / 2850 psi are an assumption: the problem
+    statement names WHP, FLP and BHP as active constraints but gives no numbers
+    anywhere. Every consumer reads PRESSURE_LIMITS and the WHP_MIN/FLP_MIN/
+    BHP_MIN scalars at call time rather than capturing them at import, so
+    patching this module is enough to move the constraint set seen by the
+    controller, the steady-state feasibility screen, the backoff tier and the
+    violation counter simultaneously. Nothing is recompiled and no tuning
+    constant is touched, which is what makes run_06_limit_sensitivity.py a test
+    of the method rather than of a particular calibration.
+    """
+    global WHP_MIN, FLP_MIN, BHP_MIN
+    saved_map = dict(PRESSURE_LIMITS)
+    saved_scalar = (WHP_MIN, FLP_MIN, BHP_MIN)
+    try:
+        PRESSURE_LIMITS.update({k: float(v) for k, v in values.items()})
+        WHP_MIN = PRESSURE_LIMITS["WHP"]
+        FLP_MIN = PRESSURE_LIMITS["FLP"]
+        BHP_MIN = PRESSURE_LIMITS["BHP"]
+        yield
+    finally:
+        PRESSURE_LIMITS.clear()
+        PRESSURE_LIMITS.update(saved_map)
+        WHP_MIN, FLP_MIN, BHP_MIN = saved_scalar
 
 
 def margins(whp, flp, bhp):

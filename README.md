@@ -98,6 +98,15 @@ binding constraint, that is exactly where the extra structure is worth having.
 
 All three pressure constraints are **lower** limits.
 
+> **The numeric values 200 / 145 / 2850 psi are an assumption of this
+> submission.** The problem statement names WHP, FLP and BHP as active
+> constraints and refers to "WHP limits, FLP limits, BHP limits" but gives no
+> numbers anywhere; they were presumably carried in the simulator that was
+> never released. Because every result below depends on them,
+> `run_06_limit_sensitivity.py` sweeps each one independently and re-runs the
+> shipped controller unmodified at every point - see
+> [Sensitivity to the assumed pressure limits](#sensitivity-to-the-assumed-pressure-limits).
+
 | constraint | limit | choke at which it binds | oil rate there |
 |---|---|---|---|
 | **BHP** | 2850 psi | **69.00 %** | **163.0 bbl/hr** |
@@ -233,7 +242,7 @@ alone would flatter the wrong controller.
 
 ## Findings
 
-### 1. Endpoint differencing understates the BHP gain by ~23 %
+### 1. Endpoint differencing understates the BHP gain by ~28 %
 
 Differencing segment endpoints gives a BHP gain of −6.08 psi/%, against
 −8.40 psi/% from full-trajectory regression — a 28 % understatement (`identify.endpoint_gain`; an earlier ad-hoc estimate put this at ~23 %). The cause
@@ -445,6 +454,112 @@ safety does not degrade at all until ±40 %: uncertainty is paid for in
 *throughput*, not in constraint violations, which is the correct trade for this
 asset.
 
+## Sensitivity to the assumed pressure limits
+
+The three numeric limits are the largest undocumented assumption in this
+submission, so they are treated as an input and swept rather than defended.
+`run_06_limit_sensitivity.py` varies each limit independently over a plausible
+range with the other two at their shipped values, and at every point re-runs
+**the shipped controller with no change of any kind** - no retuning, no
+re-identification, no change to the backoff, the horizon or the feasibility
+screen. 31 limit sets x scenarios A, B, C x 5 seeds = **82 150 controlled
+hours**.
+
+| BHP limit | binds first | binding choke | max safe rate | true violations |
+|---|---|---|---|---|
+| 2800 | BHP | 76.17 % | 173.98 | 0 |
+| 2820 | BHP | 73.25 % | 169.61 | 0 |
+| **2850** | **BHP** | **69.00 %** | **163.05** | **0** |
+| 2880 | BHP | 64.86 % | 156.49 | 0 |
+| 2900 | BHP | 62.17 % | 152.12 | 0 |
+
+| WHP limit | binds first | binding choke | max safe rate | true violations |
+|---|---|---|---|---|
+| 180 | BHP | 69.00 % | 163.05 | 0 |
+| **200** | **BHP** | **69.00 %** | **163.05** | **0** |
+| 210 | BHP | 69.00 % | 163.05 | 0 |
+| 215 | **WHP** | 66.07 % | 158.42 | 0 |
+| 220 | **WHP** | 62.56 % | 152.75 | 0 |
+
+| FLP limit | binds first | binding choke | max safe rate | true violations |
+|---|---|---|---|---|
+| 135 | BHP | 69.00 % | 163.05 | 0 |
+| **145** | **BHP** | **69.00 %** | **163.05** | **0** |
+| 152.5 | BHP | 69.00 % | 163.05 | 0 |
+| 155 | **FLP** | 66.04 % | 158.38 | 0 |
+| 160 | **FLP** | 60.32 % | 149.05 | 0 |
+
+`figures/06_limit_sensitivity.png`; full grid in `data/limit_sensitivity.csv`.
+
+**The claim holds.** Across the whole plausible limit space:
+
+- **0 true violations** and **0 measured violations** in 82 150 controlled hours
+- worst true excursion depth **0.000 psi**
+- the smallest true margin ever held was **+3.60 psi** (WHP, at a WHP limit of
+  220 psi, scenario C)
+- the maximum safe rate moves over **149.05-173.98 bbl/hr**, a 17 % spread
+- the *active constraint* changes identity: BHP at 26 of the 31 points, WHP at
+  2, FLP at 3
+
+The specific numbers change; the method does not. 163 bbl/hr is a consequence
+of the assumed limits, not a property of the well, and the README should be
+read that way. What survives the sweep is the structure: BHP binds first over
+most of the plausible space, the binding choke position and the rate ceiling
+track the limit smoothly and predictably, and the controller stays feasible
+throughout.
+
+### A different active constraint, without retuning
+
+The sweep deliberately includes cases where the constraint the controller was
+designed around is *not* the one that binds. At WHP >= 215 psi and FLP >= 155
+psi, BHP is no longer first. Nothing in the controller is specialised to BHP -
+the prediction, the three-tier ladder, the backoff and the steady-state
+feasibility screen all iterate over `limits.PRESSURE_ORDER` and read
+`limits.PRESSURE_LIMITS` at call time - so the active constraint simply
+changes and the controller tracks it.
+
+At **FLP = 160 psi**, FLP binds at 60.32 % choke and the ceiling falls to
+149.05 bbl/hr. That is below scenario B's 150 bbl/hr target, so a scenario that
+is feasible as shipped becomes infeasible, and the controller detects it and
+says so:
+
+```
+scenario B, target 150 bbl/hr: settled 139.39 bbl/hr, min BHP 2951.5 psi,
+  0 true violations in 900 h
+  ADVISORY: Target 150.0 bbl/hr infeasible. Maximum safe rate 149.05 bbl/hr,
+  limited by FLP at 160 psi. Controller will hold 139.72 bbl/hr at 54.82 %
+  choke, keeping a 5 psi FLP backoff margin.
+```
+
+The advisory names FLP, not BHP, with no code change.
+
+### Operator advisory on infeasible targets
+
+`mpc.infeasibility_report(target)` returns `None` when a target is achievable
+and otherwise an operator-facing message naming both the achievable rate and
+the constraint responsible. It reports two numbers deliberately:
+
+- the **hard-limit** ceiling, what the well can physically deliver
+- the rate the controller **will actually hold**, which is lower because of the
+  backoff margin
+
+An operator asking "why am I asking for 200 and getting 160" needs the second
+number and needs the constraint named, rather than having to infer it from
+which pressure trace looks flattest. Shown in the scenario C output of
+`run_03_scenarios.py`:
+
+```
+--- Scenario C: 200 bbl/hr requested (infeasible) ---
+  operator requests 200 bbl/hr; BHP limits the well to ~163
+  ADVISORY: Target 200.0 bbl/hr infeasible. Maximum safe rate 163.05 bbl/hr,
+  limited by BHP at 2850 psi. Controller will hold 159.77 bbl/hr at 66.91 %
+  choke, keeping a 15 psi BHP backoff margin.
+```
+
+Every step also carries `target_infeasible`, `rate_ceiling` and
+`ceiling_binding` in `ChokeMPC.last_info`, so a host system can raise the
+condition without polling a separate function.
+
 ## Conformance to the eight Simulator Assumptions
 
 The problem statement's Simulator Assumptions are the closest thing to a
@@ -524,6 +639,7 @@ physical shut-in condition.
 | `data/horizon_sweep.csv` | horizon 1-60, scenarios A and C |
 | `data/montecarlo_runs.csv` | 700 Monte Carlo runs, one row each |
 | `data/montecarlo_envelope.csv` | robustness envelope vs mismatch magnitude |
+| `data/limit_sensitivity.csv` | 31 limit sets x 3 scenarios, envelope + violations |
 | `figures/01_steptest_long.png` | step test trends, limits dashed |
 | `figures/01_steptest_short.png` | same, undersettled variant |
 | `figures/01_endpoint_gain_bias.png` | Finding 1 evidence |
@@ -536,6 +652,7 @@ physical shut-in condition.
 | `figures/05_montecarlo.png` | min-BHP and production distributions at ±20 % |
 | `figures/05_robustness_envelope.png` | Finding: envelope vs mismatch magnitude |
 | `figures/04c_fairness_zero_backoff.png` | zero-backoff fairness evidence |
+| `figures/06_limit_sensitivity.png` | max safe rate and margin held vs each assumed limit |
 | **`notebook/Autonomous_Choke_Control.ipynb`** | **primary submission artifact, executed** |
 
 All figures are 150 dpi PNGs in `figures/`.
@@ -550,6 +667,7 @@ python run_03_scenarios.py      # scenarios A, B, C with the shipped controller
 python run_04_baseline_compare.py   # ablation + PI, metrics table, headline figure
 python run_04b_horizon_sweep.py     # prediction horizon 1-60
 python run_05_montecarlo.py         # 700 runs, robustness envelope
+python run_06_limit_sensitivity.py  # sweep the assumed pressure limits
 ```
 
 The primary submission artifact is `notebook/Autonomous_Choke_Control.ipynb`,
