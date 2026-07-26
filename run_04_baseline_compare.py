@@ -207,7 +207,7 @@ def fairness_figure(df, path):
 def headline_figure(path):
     sc = SCENARIOS["C"]
     series = [
-        ("MPC, horizon 12", lambda: ChokeMPC(ABLATIONS["mpc_h12_sat"]),
+        ("MPC, horizon 12 (shipped)", lambda: ChokeMPC(PRODUCTION),
          C_MPC, 2.3, 0.60, 26),
         ("One-step, horizon 1", lambda: ChokeMPC(ABLATIONS["mpc_h1_lin"]),
          C_NAIVE, 2.0, 0.36, -30),
@@ -231,13 +231,20 @@ def headline_figure(path):
                     textcoords="offset points", color=color, fontsize=10,
                     weight="bold", ha="center", zorder=4)
         stats.append((label, color, int(np.sum(y < limits.BHP_MIN)),
+                      int(np.sum(rec["BHP_meas"] < limits.BHP_MIN)),
                       float(np.mean(rec["Q_true"][-30:]))))
 
-    lines = [f"{lab}:  {n} of {sc.hours} h below limit,  {q:.0f} bbl/hr"
-             for lab, col, n, q in stats]
+    w = max(len(lab) for lab, *_ in stats)
+    lines = [f"{lab + ':':{w + 1}s}  {nt:>3d} true / {nm:>3d} measured h "
+             f"below limit,  {q:.0f} bbl/hr" for lab, col, nt, nm, q in stats]
     ax.text(0.985, 0.965, "\n".join(lines), transform=ax.transAxes, ha="right",
-            va="top", fontsize=8.6, color=C_MUTED, linespacing=1.6,
+            va="top", fontsize=8.0, color=C_MUTED, linespacing=1.6,
+            family="DejaVu Sans Mono",
             bbox=dict(boxstyle="round,pad=0.5", fc="#fcfcfb", ec="#dedeD9", lw=0.8))
+    caption = (f"true = noise-free plant state; measured includes sensor noise. "
+               f"{sc.hours} h, seed 0.   "
+               f"Like-for-like ablation with the steady-state screen off in "
+               f"every cell: figures/04_metrics_table.png")
 
     ax.set_xlim(0, sc.hours)
     ax.set_ylim(2620, 3230)
@@ -252,8 +259,10 @@ def headline_figure(path):
         ax.spines[s].set_color("#cfcfcb")
     ax.tick_params(labelsize=9, color="#cfcfcb")
     fig.tight_layout()
+    fig.text(0.5, -0.005, caption, ha="center", va="top", fontsize=7.4,
+             color=C_MUTED, style="italic")
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

@@ -287,7 +287,7 @@ class ChokeMPC:
     backoff_start is therefore a fixed physical quantity, not a fraction of
     the horizon: BACKOFF_START_HOURS is the time BHP needs to recover the
     margin after a full-rate close, about 6 h for a 15 psi margin given a
-    -8.4 psi/% gain, a 5%/interval move limit and tau 12.3 h. It is the same
+    -8.49 psi/% gain, a 5%/interval move limit and tau 12.3 h. It is the same
     number of steps for every configuration, so no cell is handicapped, and
     it is clamped to horizon-1 so a one-step controller must satisfy the
     margin immediately - a real consequence of the short horizon, and

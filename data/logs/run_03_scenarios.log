@@ -1,0 +1,45 @@
+==============================================================================
+RUN 03 - CLOSED-LOOP SCENARIOS
+==============================================================================
+controller: MPC h=12, saturating + SS-feasible inputs
+horizon 12, control horizon 3, move weight 1.0
+steady-state-feasible inputs: True
+backoff: {'WHP': 5.0, 'FLP': 5.0, 'BHP': 15.0}  applied from step 6
+backoff production cost: 3.28 bbl/hr (2.01%, 79 bbl/day)
+
+--- Scenario A: startup 20% choke -> 120 bbl/hr ---
+  cold start from 20% choke to a 120 bbl/hr target
+  settling to +/-2% of target : 9 h
+  IAE                         : 329.5 bbl/hr*h
+  final rate / choke          : 119.66 bbl/hr / 43.70 %
+  total production            : 17763 bbl over 150 h
+  min BHP true / measured     : 3041.84 / 3030.86 psi
+  violations true / measured  : 0 / 0  of 150
+  soft-fallback steps         : 0
+  wrote scenario_A.csv, 03_scenario_A.png
+
+--- Scenario B: 100 -> 150 bbl/hr target change ---
+  settled at 100 bbl/hr, step target to 150 bbl/hr at t=40 h
+  settling to +/-2% of target : 11 h
+  IAE                         : 367.0 bbl/hr*h
+  final rate / choke          : 149.33 bbl/hr / 60.40 %
+  total production            : 24718 bbl over 180 h
+  min BHP true / measured     : 2904.65 / 2896.62 psi
+  violations true / measured  : 0 / 0  of 180
+  soft-fallback steps         : 0
+  wrote scenario_B.csv, 03_scenario_B.png
+
+--- Scenario C: 200 bbl/hr requested (infeasible) ---
+  operator requests 200 bbl/hr; BHP limits the well to ~163
+  ADVISORY: Target 200.0 bbl/hr infeasible. Maximum safe rate 163.05 bbl/hr, limited by BHP at 2850 psi. Controller will hold 159.77 bbl/hr at 66.91 % choke, keeping a 15 psi BHP backoff margin.
+  settling to +/-2% of target : not reached
+  IAE                         : 8647.8 bbl/hr*h
+  final rate / choke          : 158.16 bbl/hr / 65.75 %
+  total production            : 31352 bbl over 200 h
+  min BHP true / measured     : 2864.03 / 2854.30 psi
+  violations true / measured  : 0 / 0  of 200
+  soft-fallback steps         : 0
+  wrote scenario_C.csv, 03_scenario_C.png
+
+wrote C:\dev\choke-mpc\data\scenario_summary.csv
+figures written to C:\dev\choke-mpc\figures

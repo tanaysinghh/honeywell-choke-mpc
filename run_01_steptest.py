@@ -25,7 +25,7 @@ from plant import ChokePlant
 DATA_DIR = ROOT / "data"
 FIG_DIR = ROOT / "figures"
 
-TAU_BHP = limits.IDENTIFIED_TAU["BHP"]
+TAU_BHP = limits.REFERENCE_FOPDT_TAU["BHP"]
 SETTLE_FACTOR = 5.0
 SEGMENT_HOURS = int(np.ceil(SETTLE_FACTOR * TAU_BHP / 10.0) * 10)
 LEVELS = [20.0, 35.0, 50.0, 65.0, 80.0, 65.0, 50.0, 35.0, 20.0]
@@ -140,11 +140,11 @@ def plot_steptest(df, path, title):
 def plot_endpoint_bias(sweep, true_gain, path):
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.axhline(true_gain, ls="--", color="k", lw=1.2,
-               label=f"regression gain {true_gain:.2f} psi/%")
+               label=f"regression gain {true_gain:.2f} psi/%  (630 h FOPDT fit)")
     ax.plot(sweep["segment_hours"], sweep["endpoint_gain"], "o-",
             color="tab:red", label="endpoint-differenced gain")
     ax.axvline(TAU_BHP, ls=":", color="tab:blue", lw=1.2,
-               label=f"tau_BHP = {TAU_BHP:.1f} h")
+               label=f"tau_BHP = {TAU_BHP:.1f} h  (reference-CSV FOPDT fit)")
     ax.set_xlabel("step segment duration [h]")
     ax.set_ylabel("estimated BHP gain [psi / % choke]")
     ax.set_title("Endpoint differencing understates BHP gain for short steps")

@@ -1,35 +1,180 @@
 # Autonomous Production Choke Controller
 
-Constraint-aware MPC for a single naturally flowing oil well. Control interval
+Constraint-aware model predictive control for a single naturally flowing oil
+well. The controller chooses a choke position once an hour to maximise oil rate
+without ever taking WHP, FLP or BHP below its limit. Control interval
 `Ts = 1 h`, choke `0-100 %`, slew limit `±5 %` per interval.
 
-**Headline result.** When an operator requests 200 bbl/hr from a well that can
-safely deliver 163, the shipped controller settles at 158 bbl/hr with **zero
-constraint violations** and holds BHP at 2864 psi against a 2850 psi limit. A
-tuned PI controller on the same target reaches 199 bbl/hr by driving BHP to
-2676 psi — 174 psi below the limit, for 177 of 200 hours. See
-`figures/04_headline_scenarioC_bhp.png`.
+## Results
 
-Robustness: **0 true violations in 300 Monte Carlo runs** with measurement
-noise and independent ±20 % gain and time-constant mismatch on every output;
-the envelope stays clean to ±30 %.
+| | |
+|---|---|
+| **Constraint violations** | **0 true**, shipped controller, in all three scenarios, all 31 pressure-limit sets, and all robustness cases to ±30 % model error |
+| **Evidence base** | **82 150 controlled hours** across 31 pressure-limit sets x 3 scenarios x 5 seeds, plus 700 Monte Carlo runs |
+| **Maximum safe rate** | **163.05 bbl/hr**, BHP-limited at 69.00 % choke; invariant to the unidentifiable saturation curvature (162.9-163.1) |
+| **Model quality** | **R2 0.997-0.999** on the fitted step test; worst *held-out* R2 **0.9889** across three datasets |
+| **Robustness** | 0 true violations to **±30 %** independent gain and time-constant error; degrades gracefully at ±40 % |
+| **Solve time** | **3.3 ms** median against a 3 600 000 ms control interval |
 
-## Plant interface and swapping in the official simulator
+**The headline case.** An operator requests 200 bbl/hr from a well that can
+safely deliver 163. The shipped controller settles at 158 bbl/hr with **0 true
+and 0 measured hours below the limit**, holding BHP at 2864 psi against a
+2850 psi limit. A tuned PI controller on the same target reaches 199 bbl/hr by
+driving BHP to 2676 psi — 174 psi below the limit, for 177 of 200 hours. A
+one-step controller using the *same model and the same cost function* spends
+124 hours below the limit.
 
-The controller only ever calls
+![headline](figures/04_headline_scenarioC_bhp.png)
+
+That figure reports both violation channels because they disagree in both
+directions: sensor noise alone puts the one-step baseline at 124 true but only
+90 measured hours below the limit, so quoting either alone would mislead.
+
+### The three findings that shaped the design
+
+**1. Endpoint differencing understates the BHP gain by 28 %.** The obvious way
+to read a gain off a step test — difference the segment endpoints — gives
+−6.08 psi/% against −8.40 psi/% from full-trajectory regression, because the
+reference test holds each level for 20-30 h while `tau_BHP` is 13 h. The error
+is systematically toward *underestimating* the gain, which is the dangerous
+direction: it makes the well look less BHP-constrained than it is.
+Full detail: **Finding 1** below.
+
+**2. Window the *margin*, never the *limit*.** The constraint ladder takes the
+first tier with a feasible candidate. Implementing the backoff tier as
+"pressure ≥ limit + margin from step 6 onward" checks *nothing at all* on steps
+0-5, and because that looser tier was almost always satisfiable the stricter
+tier was never reached. At horizon 36 the controller held a choke whose steady
+BHP was 2795 psi for an entire run — 166 of 200 samples in violation — while
+every plan it evaluated looked feasible.
+Full detail: **Finding 4** below.
+
+**3. Violations collapse at a prediction horizon of ~1 x `tau_BHP`.** The knee
+is sharp and it is located by the dominant time constant, not by tuning: 104
+violations at horizon 1, 0.2 at horizon 12 (`0.97 x tau_BHP`). But a longer
+horizon fixes violations without fixing *overshoot* — that needs the
+steady-state feasibility screen, a separate mechanism.
+Full detail: **Finding 5** below.
+
+Four further findings are in [Findings](#findings).
+
+## Setup and reproduction
+
+```
+python -m venv .venv
+.venv\Scripts\activate            # Windows;  source .venv/bin/activate on POSIX
+pip install -r requirements.txt
+python run_all.py
+```
+
+`run_all.py` executes all seven stages in order, prints a progress line and
+elapsed time per stage, and reports the total. Per-stage console output goes to
+`data/logs/`.
+
+**Expected runtime: about 11 minutes** on a laptop (measured: 11 m 06 s, Python
+3.12, 8-core Windows). Two stages dominate:
+
+| stage | what it does | runtime |
+|---|---|---|
+| `run_05_montecarlo.py` | 700 Monte Carlo runs + mismatch envelope | ~4 m |
+| `run_06_limit_sensitivity.py` | 31 limit sets x 3 scenarios x 5 seeds | ~2 m |
+| `run_04_baseline_compare.py` | ablation + PI, 5 seeds | ~2 m |
+| `run_04b_horizon_sweep.py` | horizons 1-60 | ~2 m |
+| `run_01/02/03` | step tests, identification, scenarios | ~1 m combined |
+
+Individual stages can be run on their own in the same order; each writes its own
+figures and CSVs and depends only on the data files written before it.
+
+The primary submission artifact is **`notebook/Autonomous_Choke_Control.ipynb`**,
+which reads top to bottom as an analysis and is committed **already executed**,
+with every output and figure embedded — a judge can read it without running
+anything. To re-execute:
+
+```
+jupyter nbconvert --to notebook --execute --inplace \
+    notebook/Autonomous_Choke_Control.ipynb
+```
+
+## Substituting the official simulator
+
+The official simulator was not released before this submission round, so
+`src/plant.py` is a behavioural surrogate calibrated to
+`data/reference_steptest.csv`. Every controller is written against one
+interface only:
 
 ```python
 Q, WHP, FLP, BHP = simulator.step(choke_position)
 ```
 
-`src/plant.py` exposes exactly `step(u)` and `reset(...)`; every other attribute
-is underscore-private. No controller module imports anything from `plant.py`.
-Replacing the surrogate with the official simulator is a **one-line change** in
-each `run_*.py` script:
+**The one-line change.** The plant is constructed in exactly **two** places in
+the whole repository, and the closed-loop work uses only the first:
+
+```
+src/evaluate.py:6        from plant import ChokePlant     <- all closed-loop runs
+run_01_steptest.py:23    from plant import ChokePlant     <- open-loop step test only
+```
+
+Replace that import:
 
 ```python
-from plant import ChokePlant as Simulator      # <- replace this import
+from plant import ChokePlant                                # <- this line
+from official_simulator import OfficialSim as ChokePlant    # <- becomes this
 ```
+
+Verify the claim rather than taking it on trust:
+
+```
+grep -rn "from plant import" src run_*.py     # exactly the two lines above
+```
+
+If the official simulator's constructor or output order differs at all, wrap it
+rather than editing controller code:
+
+```python
+from simulator_adapter import SimulatorAdapter
+Simulator = lambda **kw: SimulatorAdapter(OfficialSim(**kw))
+```
+
+`SimulatorAdapter` normalises tuples, lists, numpy arrays and dicts to a
+4-tuple of finite floats in `(Q, WHP, FLP, BHP)` order, remaps a different
+output order via `output_order=`, forwards `reset()` when present, and raises
+`ConformanceError` at the boundary rather than letting a malformed reading
+reach the controller.
+
+**Check the contract first:**
+
+```
+python src/simulator_adapter.py                        # the shipped surrogate
+python src/simulator_adapter.py mymodule:MySimulator   # a candidate
+```
+
+The conformance test builds a fresh instance per check and verifies that
+`step(u)` returns four finite floats, that `u` is accepted over 0-100 %, that
+the simulator is reproducible under a fixed seed (skipped, not failed, when no
+`seed` argument is exposed), and that the steady-state map is monotone —
+`dQ/du > 0` and all three `dP/du < 0` — over 20-80 % choke. Monotonicity is the
+one that matters most: the steady-state feasibility screen and the bisection for
+maximum feasible choke both assume it, and a simulator that violates it will
+make the screen select the wrong branch rather than merely perform worse.
+
+Against the shipped surrogate, all seven checks pass:
+
+```
+  [PASS] returns four finite floats (Q, WHP, FLP, BHP)  Q=99.11, WHP=268.8, FLP=186.8, BHP=3161
+  [PASS] accepts u over 0-100 %                         accepted 0, 1, 50, 99, 100 %
+  [PASS] deterministic under a fixed seed               42 steps, seed 1234, max |difference| 0.000e+00
+  [PASS] dQ/du > 0 over 20-80 % in 10 % steps           min increment +15.0218 bbl/hr, Q 71.08 -> 179.63
+  [PASS] dWHP/du < 0 over 20-80 % in 10 % steps         max increment -13.1845 psi, WHP 291.84 -> 196.57
+  [PASS] dFLP/du < 0 over 20-80 % in 10 % steps         max increment -8.0593 psi, FLP 201.80 -> 143.56
+  [PASS] dBHP/du < 0 over 20-80 % in 10 % steps         max increment -68.6150 psi, BHP 3269.37 -> 2773.52
+  VERDICT: CONFORMANT
+```
+
+## Plant interface
+
+`src/plant.py` exposes exactly `step(u)` and `reset(...)`; every other attribute
+is underscore-private, and **no controller module imports anything from
+`plant.py`**. That is what makes the substitution above a one-line change.
 
 Anything the surrogate needs but the real simulator does not have (noise
 settings, gain/tau mismatch for Monte Carlo) is passed to the *constructor*, not
@@ -52,21 +197,58 @@ depends only on the choke sequence — noise and drift are additive at the outpu
 
 ## Identified model
 
+### Which BHP gain is which
+
+Three different BHP gains appear in this repository. They are three different
+*quantities*, not three estimates of one number, and each is correct in its own
+place. The **canonical value for the shipped model is −8.49 psi/%**; the other
+two are always labelled with their dataset and structure.
+
+| value | dataset | structure | what it is | constant |
+|---|---|---|---|---|
+| **−8.49 psi/%** | 630 h own step test | **saturating** | **the shipped model**, local gain at 45 % choke | `limits.SHIPPED_GAIN_AT_45` |
+| −8.35 psi/% | 630 h own step test | linear FOPDT | the *linear ablation* model only | `limits.LINEAR_ABLATION_GAIN` |
+| −8.40 psi/% | reference CSV (120 h) | linear FOPDT | the **first-pass** fit, used to *design* the step test | `limits.REFERENCE_FOPDT_GAIN` |
+
+The same applies to `tau_BHP`: **12.34 h** is the shipped value
+(`limits.SHIPPED_TAU`), and the 13.12 h that appears in
+`figures/01_endpoint_gain_bias.png` is the reference-CSV fit — correct there,
+because the step test was *designed* from the reference fit before the 630 h
+data existed. The design chronology is: fit the reference CSV → size the step
+test at 5 x tau → run it → refit on the result → ship that.
+
+### First pass: reference CSV
+
 Fitted to `data/reference_steptest.csv` by simulation-error minimisation over
 all 120 samples (not endpoint differencing — see Finding 1). First-order, no
-deadtime; second-order and deadtime 1-3 h were tested and all fit worse.
+deadtime; second-order and deadtime 1-3 h were tested and all fit worse. **This
+is not the shipped model** — it sized the step test.
 
-| output | gain @45 % | tau (h) | meas. sigma | R2 (reference CSV) |
+| output | gain (linear FOPDT) | tau (h) | meas. sigma | R2 (reference CSV) |
 |---|---|---|---|---|
-| Oil rate | **+1.83** bbl/hr per % | 5.42 | 0.37 | 0.9977 |
-| WHP | **−1.61** psi per % | 9.33 | 0.32 | 0.9968 |
-| FLP | **−0.98** psi per % | 6.52 | 0.34 | 0.9936 |
-| BHP | **−8.40** psi per % | 13.12 | 1.96 | 0.9951 |
+| Oil rate | +1.83 bbl/hr per % | 5.42 | 0.37 | 0.9977 |
+| WHP | −1.61 psi per % | 9.33 | 0.32 | 0.9968 |
+| FLP | −0.98 psi per % | 6.52 | 0.34 | 0.9936 |
+| BHP | −8.40 psi per % | 13.12 | 1.96 | 0.9951 |
+
+### Shipped model: 630 h step test, saturating
+
+Refitted on `data/steptest_long.csv`. These are the coefficients the controller
+actually predicts with (`mpc.IDENTIFIED_SATURATING`).
+
+| output | gain @45 % | tau (h) |
+|---|---|---|
+| Oil rate | **+1.86** bbl/hr per % | 4.56 |
+| WHP | **−1.64** psi per % | 8.09 |
+| FLP | **−0.99** psi per % | 5.80 |
+| BHP | **−8.49** psi per % | **12.34** |
 
 The static map is a saturating choke characteristic — one shared normalised
 `phi(u)` across all four outputs, since all four are driven by the same flow
 path — so the model stays monotone and physically sensible when extrapolated to
-`u = 100`. Local gain falls from 2.07 to 1.26 bbl/hr/% across 0-100 %.
+`u = 100`. Oil-rate local gain falls from **2.56 to 1.25** bbl/hr/% across
+0-100 % (shipped model; an earlier note gave 2.07 → 1.26 from the reference-CSV
+fit).
 
 Residuals sit at roughly 3x the white-noise sigma with lag-1 autocorrelation
 0.77-0.86, i.e. the reference data contains a *coloured* disturbance, not just
@@ -89,8 +271,9 @@ across all four outputs and all three datasets is **0.9889**.
 | BHP | 0.99868 | 0.99793 | 0.99207 |
 
 The saturating structure earns its place mainly on BHP: on the held-out
-reference test it cuts BHP RMSE by **26.6 %** versus linear FOPDT (6.13 vs
-8.35 psi) and oil-rate RMSE by 11.1 %, while WHP and FLP are a wash (−3.6 %,
+reference test it cuts BHP RMSE by **26.6 %** versus linear FOPDT (RMSE 6.13 vs
+8.35 psi — an RMSE, unrelated to the −8.35 psi/% gain above) and oil-rate RMSE
+by 11.1 %, while WHP and FLP are a wash (−3.6 %,
 −0.1 %) — those two are close to linear over the tested range. Since BHP is the
 binding constraint, that is exactly where the extra structure is worth having.
 
@@ -245,7 +428,10 @@ alone would flatter the wrong controller.
 ### 1. Endpoint differencing understates the BHP gain by ~28 %
 
 Differencing segment endpoints gives a BHP gain of −6.08 psi/%, against
-−8.40 psi/% from full-trajectory regression — a 28 % understatement (`identify.endpoint_gain`; an earlier ad-hoc estimate put this at ~23 %). The cause
+−8.40 psi/% from full-trajectory regression — a 28 % understatement (`identify.endpoint_gain`; an earlier ad-hoc estimate put this at ~23 %). Both
+numbers here are the **reference-CSV fit**, which is the correct pair to compare
+because the finding is about the reference test's short segments; the shipped
+model's gain is −8.49 psi/% (630 h saturating fit). The cause
 is that the reference step test holds each choke level for 20-30 h while
 `tau_BHP = 13.1 h`, so BHP has only reached 78-90 % of its final value when the
 next step is applied. The error is systematically toward *underestimating* the
@@ -657,35 +843,33 @@ physical shut-in condition.
 
 All figures are 150 dpi PNGs in `figures/`.
 
-## Running
+## Stages
+
+Each stage is independently runnable, in this order. `run_all.py` runs all
+seven; see [Setup and reproduction](#setup-and-reproduction) for runtimes.
 
 ```
-python src/plant.py             # surrogate vs reference CSV, RMSE table
-python run_01_steptest.py       # step tests, settling check, gain-bias sweep
-python run_02_identify.py       # fit + held-out validation, R2 per output
-python run_03_scenarios.py      # scenarios A, B, C with the shipped controller
+python src/plant.py                 # surrogate vs reference CSV, RMSE table
+python src/simulator_adapter.py     # simulator conformance test
+python run_01_steptest.py           # step tests, settling check, gain-bias sweep
+python run_02_identify.py           # fit + held-out validation, R2 per output
+python run_03_scenarios.py          # scenarios A, B, C with the shipped controller
 python run_04_baseline_compare.py   # ablation + PI, metrics table, headline figure
 python run_04b_horizon_sweep.py     # prediction horizon 1-60
 python run_05_montecarlo.py         # 700 runs, robustness envelope
 python run_06_limit_sensitivity.py  # sweep the assumed pressure limits
 ```
 
-The primary submission artifact is `notebook/Autonomous_Choke_Control.ipynb`,
-which reads top to bottom as an analysis and is committed with all outputs and
-figures executed and embedded. It recomputes the fast results live and embeds
-the pre-rendered figures for the expensive sweeps, each reproducible with one
-script above.
-
-`run_04_baseline_compare.py` and `run_05_montecarlo.py` take a few minutes each;
-everything else is seconds.
-
 ## Source layout
 
 | file | role |
 |---|---|
 | `src/plant.py` | behavioural surrogate; exposes only `step()` and `reset()` |
+| `src/simulator_adapter.py` | adapter + conformance test for the official simulator |
 | `src/limits.py` | operating envelope, identified constants, violation checks |
 | `src/identify.py` | FOPDT and saturating model fitting, R2, residual plots |
 | `src/mpc.py` | receding-horizon MPC, ablation configs, shipped config |
 | `src/pid.py` | velocity-form PI baseline on oil rate, no constraint awareness |
 | `src/evaluate.py` | shared closed-loop harness, scenarios, metrics, true-state replay |
+| `run_all.py` | single entry point: all seven stages in order, with timings |
+| `requirements.txt` | pinned dependency versions |
